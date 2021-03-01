@@ -55,11 +55,12 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.text.MessageFormat;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Date;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.eclipse.jgit.annotations.NonNull;
 import org.eclipse.jgit.annotations.Nullable;
@@ -86,6 +87,7 @@ import org.slf4j.LoggerFactory;
  * In general this class is not thread-safe. So any consumer needs to take care
  * of synchronization!
  *
+ * @see <a href="https://curl.se/docs/http-cookies.html">Cookie file format</a>
  * @see <a href="http://www.cookiecentral.com/faq/#3.5">Netscape Cookie File
  *      Format</a>
  * @see <a href=
@@ -125,7 +127,7 @@ public final class NetscapeCookieFile {
 
 	private byte[] hash;
 
-	final Date creationDate;
+	private final Instant createdAt;
 
 	private Set<HttpCookie> cookies = null;
 
@@ -137,13 +139,13 @@ public final class NetscapeCookieFile {
 	 *            where to find the cookie file
 	 */
 	public NetscapeCookieFile(Path path) {
-		this(path, new Date());
+		this(path, Instant.now());
 	}
 
-	NetscapeCookieFile(Path path, Date creationDate) {
+	NetscapeCookieFile(Path path, Instant createdAt) {
 		this.path = path;
 		this.snapshot = FileSnapshot.DIRTY;
-		this.creationDate = creationDate;
+		this.createdAt = createdAt;
 	}
 
 	/**
@@ -175,7 +177,7 @@ public final class NetscapeCookieFile {
 		if (cookies == null || refresh) {
 			try {
 				byte[] in = getFileContentIfModified();
-				Set<HttpCookie> newCookies = parseCookieFile(in, creationDate);
+				Set<HttpCookie> newCookies = parseCookieFile(in, createdAt);
 				if (cookies != null) {
 					cookies = mergeCookies(newCookies, cookies);
 				} else {
@@ -201,9 +203,9 @@ public final class NetscapeCookieFile {
 	 *
 	 * @param input
 	 *            the file content to parse
-	 * @param creationDate
-	 *            the date for the creation of the cookies (used to calculate
-	 *            the maxAge based on the expiration date given within the file)
+	 * @param createdAt
+	 *            cookie creation time; used to calculate the maxAge based on
+	 *            the expiration date given within the file
 	 * @return the set of parsed cookies from the given file (even expired
 	 *         ones). If there is more than one cookie with the same name in
 	 *         this file the last one overwrites the first one!
@@ -213,7 +215,7 @@ public final class NetscapeCookieFile {
 	 *             if the given file does not have a proper format
 	 */
 	private static Set<HttpCookie> parseCookieFile(@NonNull byte[] input,
-			@NonNull Date creationDate)
+			@NonNull Instant createdAt)
 			throws IOException, IllegalArgumentException {
 
 		String decoded = RawParseUtils.decode(StandardCharsets.US_ASCII, input);
@@ -223,7 +225,7 @@ public final class NetscapeCookieFile {
 				new StringReader(decoded))) {
 			String line;
 			while ((line = reader.readLine()) != null) {
-				HttpCookie cookie = parseLine(line, creationDate);
+				HttpCookie cookie = parseLine(line, createdAt);
 				if (cookie != null) {
 					cookies.add(cookie);
 				}
@@ -233,7 +235,7 @@ public final class NetscapeCookieFile {
 	}
 
 	private static HttpCookie parseLine(@NonNull String line,
-			@NonNull Date creationDate) {
+			@NonNull Instant createdAt) {
 		if (line.isEmpty() || (line.startsWith("#") //$NON-NLS-1$
 				&& !line.startsWith(HTTP_ONLY_PREAMBLE))) {
 			return null;
@@ -269,7 +271,12 @@ public final class NetscapeCookieFile {
 		cookie.setSecure(Boolean.parseBoolean(cookieLineParts[3]));
 
 		long expires = Long.parseLong(cookieLineParts[4]);
-		long maxAge = (expires - creationDate.getTime()) / 1000;
+		// Older versions stored milliseconds. This heuristic to detect that
+		// will cause trouble in the year 33658. :-)
+		if (cookieLineParts[4].length() == 13) {
+			expires = TimeUnit.MILLISECONDS.toSeconds(expires);
+		}
+		long maxAge = expires - createdAt.getEpochSecond();
 		if (maxAge <= 0) {
 			return null; // skip expired cookies
 		}
@@ -278,7 +285,7 @@ public final class NetscapeCookieFile {
 	}
 
 	/**
-	 * Read the underying file and return its content but only in case it has
+	 * Read the underlying file and return its content but only in case it has
 	 * been modified since the last access.
 	 * <p>
 	 * Internally calculates the hash and maintains {@link FileSnapshot}s to
@@ -366,7 +373,7 @@ public final class NetscapeCookieFile {
 						path);
 				// reread new changes if necessary
 				Set<HttpCookie> cookiesFromFile = NetscapeCookieFile
-						.parseCookieFile(cookieFileContent, creationDate);
+						.parseCookieFile(cookieFileContent, createdAt);
 				this.cookies = mergeCookies(cookiesFromFile, cookies);
 			}
 		} catch (FileNotFoundException e) {
@@ -376,7 +383,7 @@ public final class NetscapeCookieFile {
 		ByteArrayOutputStream output = new ByteArrayOutputStream();
 		try (Writer writer = new OutputStreamWriter(output,
 				StandardCharsets.US_ASCII)) {
-			write(writer, cookies, url, creationDate);
+			write(writer, cookies, url, createdAt);
 		}
 		LockFile lockFile = new LockFile(path.toFile());
 		for (int retryCount = 0; retryCount < LOCK_ACQUIRE_MAX_RETRY_COUNT; retryCount++) {
@@ -410,24 +417,23 @@ public final class NetscapeCookieFile {
 	 * @param url
 	 *            the url for which to write the cookie (to derive the default
 	 *            values for certain cookie attributes)
-	 * @param creationDate
-	 *            the date when the cookie has been created. Important for
-	 *            calculation the cookie expiration time (calculated from
-	 *            cookie's maxAge and this creation time)
+	 * @param createdAt
+	 *            cookie creation time; used to calculate a cookie's expiration
+	 *            time
 	 * @throws IOException
 	 *             if an I/O error occurs
 	 */
 	static void write(@NonNull Writer writer,
 			@NonNull Collection<HttpCookie> cookies, @NonNull URL url,
-			@NonNull Date creationDate) throws IOException {
+			@NonNull Instant createdAt) throws IOException {
 		for (HttpCookie cookie : cookies) {
-			writeCookie(writer, cookie, url, creationDate);
+			writeCookie(writer, cookie, url, createdAt);
 		}
 	}
 
 	private static void writeCookie(@NonNull Writer writer,
 			@NonNull HttpCookie cookie, @NonNull URL url,
-			@NonNull Date creationDate) throws IOException {
+			@NonNull Instant createdAt) throws IOException {
 		if (cookie.getMaxAge() <= 0) {
 			return; // skip expired cookies
 		}
@@ -455,7 +461,7 @@ public final class NetscapeCookieFile {
 		final String expirationDate;
 		// whenCreated field is not accessible in HttpCookie
 		expirationDate = String
-				.valueOf(creationDate.getTime() + (cookie.getMaxAge() * 1000));
+				.valueOf(createdAt.getEpochSecond() + cookie.getMaxAge());
 		writer.write(expirationDate);
 		writer.write(COLUMN_SEPARATOR);
 		writer.write(cookie.getName());
